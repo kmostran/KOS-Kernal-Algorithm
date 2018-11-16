@@ -1,0 +1,564 @@
+From 58b87cf9929e6fe15f4471bf7390fe2e9bfd9649 Mon Sep 17 00:00:00 2001
+From: kmostran <kmostran@zone43-ed.cs.ucalgary.ca>
+Date: Sat, 15 Oct 2016 22:38:28 -0600
+Subject: [PATCH 2/2] Finished Assignment 2
+
+---
+ src/include/syscalls.h        |   6 ++
+ src/kernel/Kernel.cc          |   4 +-
+ src/kernel/syscalls.cc        |  34 +++++++++++-
+ src/machine/Machine.cc        |  10 +++-
+ src/machine/Machine.h         |   3 +-
+ src/main/InitProcess.cc       |  34 +++++++++++-
+ src/runtime/Scheduler.cc      |  65 ++++++++++++++++------
+ src/ulib/libKOS.cc            |  12 +++-
+ src/user/Programs.cc          |  12 ++++
+ src/user/progA.cc             |  14 +++++
+ src/user/progB.cc             |  14 +++++
+ src/user/progC.cc             |  14 +++++
+ src/user/schedAffinityTest.cc | 126 ++++++++++++++++++++++++++++++++++++++++++
+ 13 files changed, 321 insertions(+), 27 deletions(-)
+ create mode 100644 src/user/Programs.cc
+ create mode 100644 src/user/progA.cc
+ create mode 100644 src/user/progB.cc
+ create mode 100644 src/user/progC.cc
+ create mode 100644 src/user/schedAffinityTest.cc
+
+diff --git a/src/include/syscalls.h b/src/include/syscalls.h
+index 4652b16..5d93996 100644
+--- a/src/include/syscalls.h
++++ b/src/include/syscalls.h
+@@ -21,10 +21,16 @@ extern "C" long get_core_count();
+ 
+ extern "C" int privilege(void*, mword, mword, mword, mword);
+ 
++extern "C" int sched_setaffinity(pid_t pid, size_t cpusetsize, cpu_set_t * mask);
++
++extern "C" int sched_getaffinity(pid_t pid, size_t cpusetsize, cpu_set_t * mask);
++
+ namespace SyscallNum {
+ 
+ enum : mword {
+   _exit = 0,
++  sched_setaffinity,
++  sched_getaffinity,
+   open,
+   close,
+   read,
+diff --git a/src/kernel/Kernel.cc b/src/kernel/Kernel.cc
+index 5a64aea..7daa7c5 100644
+--- a/src/kernel/Kernel.cc
++++ b/src/kernel/Kernel.cc
+@@ -1,5 +1,5 @@
+ /******************************************************************************
+-    Copyright © 2012-2015 Martin Karsten
++    Copyright ï¿½ 2012-2015 Martin Karsten
+ 
+     This program is free software: you can redistribute it and/or modify
+     it under the terms of the GNU General Public License as published by
+@@ -69,7 +69,7 @@ void kosMain() {
+ #if TESTING_PING_LOOP
+   for (;;) {
+     Timeout::sleep(Clock::now() + 1000);
+-    KOUT::outl("...ping...");
++    //KOUT::outl("...ping...");
+   }
+ #endif
+ }
+diff --git a/src/kernel/syscalls.cc b/src/kernel/syscalls.cc
+index 763e731..9e1a564 100644
+--- a/src/kernel/syscalls.cc
++++ b/src/kernel/syscalls.cc
+@@ -1,5 +1,5 @@
+ /******************************************************************************
+-    Copyright © 2012-2015 Martin Karsten
++    Copyright ï¿½ 2012-2015 Martin Karsten
+ 
+     This program is free software: you can redistribute it and/or modify
+     it under the terms of the GNU General Public License as published by
+@@ -243,9 +243,41 @@ extern "C" int isatty(int fd) {
+ 
+ void* __dso_handle = nullptr;
+ 
++extern "C" int sched_setaffinity(pid_t pid, size_t cpusetsize, cpu_set_t *mask){
++  //return EPERM conditions
++  if (pid != 0){
++    return -1;
++  }
++  //Add core amount of zeros to pCount. (ex. core = 4, pCount=10000)
++  unsigned long pCount = (1 << Machine::getProcessorCount());
++  //If processorCount is less then or equal to the mask passed in then there is an
++  //error. (EINVAL)
++  if (pCount <= *mask){
++    return -1;
++  }
++  //Set the affinity mask, and tell the processor to send to proper queue
++  LocalProcessor::getCurrThread()->setAffinityMask(*mask);
++  LocalProcessor::getScheduler()->yield();
++  return 0;
++}
++
++extern "C" int sched_getaffinity(pid_t pid, size_t cpusetsize, cpu_set_t *mask){
++  //return EPERM
++  if (pid != 0){
++    return -1;
++  }else{
++    //Get mask and return zero
++    *mask = LocalProcessor::getCurrThread()->getAffinityMask();
++    return 0;
++  }
++}
++
++
+ typedef ssize_t (*syscall_t)(mword a1, mword a2, mword a3, mword a4, mword a5);
+ static const syscall_t syscalls[] = {
+   syscall_t(_exit),
++  syscall_t(sched_setaffinity),
++  syscall_t(sched_getaffinity),
+   syscall_t(open),
+   syscall_t(close),
+   syscall_t(read),
+diff --git a/src/machine/Machine.cc b/src/machine/Machine.cc
+index d10deb0..01c0c0b 100644
+--- a/src/machine/Machine.cc
++++ b/src/machine/Machine.cc
+@@ -1,5 +1,5 @@
+ /******************************************************************************
+-    Copyright © 2012-2015 Martin Karsten
++    Copyright ï¿½ 2012-2015 Martin Karsten
+ 
+     This program is free software: you can redistribute it and/or modify
+     it under the terms of the GNU General Public License as published by
+@@ -444,6 +444,12 @@ void Machine::setAffinity(Thread& t, mword idx) {
+   t.setAffinity(processorTable[idx].scheduler);
+ }
+ 
++Scheduler* Machine::getScheduler(mword idx){
++  KASSERT1(idx<processorCount, idx);
++  return processorTable[idx].scheduler;
++}
++
++
+ void Machine::sendIPI(mword idx, uint8_t vec) {
+   MappedAPIC()->sendIPI(processorTable[idx].apicID, vec);
+ }
+@@ -533,7 +539,7 @@ void Machine::setupIDTable() {
+   for (size_t i = 0; i < MaxIrqCount; i += 1) {
+     irqTable[i].ioApicAddr    = 0;
+     irqTable[i].ioApicIrq     = 0;
+-    irqTable[i].globalIrq     = i; 
++    irqTable[i].globalIrq     = i;
+     irqTable[i].overrideFlags = 0;
+   }
+ 
+diff --git a/src/machine/Machine.h b/src/machine/Machine.h
+index d4182a3..89602b8 100644
+--- a/src/machine/Machine.h
++++ b/src/machine/Machine.h
+@@ -1,5 +1,5 @@
+ /******************************************************************************
+-    Copyright © 2012-2015 Martin Karsten
++    Copyright ï¿½ 2012-2015 Martin Karsten
+ 
+     This program is free software: you can redistribute it and/or modify
+     it under the terms of the GNU General Public License as published by
+@@ -51,6 +51,7 @@ public:
+   static void registerIrqSync(mword irq, mword vec);
+   static void registerIrqAsync(mword irq, funcvoid1_t handler, ptr_t ctx);
+   static void deregisterIrqAsync(mword irq, funcvoid1_t handler);
++  static Scheduler* getScheduler(mword idx);
+ };
+ 
+ void Breakpoint2(vaddr ia = 0) __ninline;
+diff --git a/src/main/InitProcess.cc b/src/main/InitProcess.cc
+index 053e8d5..a405f74 100644
+--- a/src/main/InitProcess.cc
++++ b/src/main/InitProcess.cc
+@@ -1,5 +1,5 @@
+ /******************************************************************************
+-    Copyright © 2012-2015 Martin Karsten
++    Copyright ï¿½ 2012-2015 Martin Karsten
+ 
+     This program is free software: you can redistribute it and/or modify
+     it under the terms of the GNU General Public License as published by
+@@ -19,13 +19,41 @@
+ int InitProcess() {
+   Process* p0 = knew<Process>();
+   p0->exec("systest");
+-#if !TESTING_KEYCODE_LOOP
++
++  //Creating Infinite Loop as instructed by TAs
++  Process* progA = knew<Process>();
++  progA->exec("progA");
++  Process* progA1 = knew<Process>();
++  progA1->exec("progA");
++  Process* progA2 = knew<Process>();
++  progA2->exec("progA");
++
++  Process* progB = knew<Process>();
++  progB->exec("progB");
++  Process* progB1 = knew<Process>();
++  progB1->exec("progB");
++  Process* progB2 = knew<Process>();
++  progB2->exec("progB");
++
++  Process* progC = knew<Process>();
++  progC->exec("progC");
++  Process* progC1 = knew<Process>();
++  progC1->exec("progC");
++  Process* progC2 = knew<Process>();
++  progC2->exec("progC");
++  //Run test programs
++  Process* p1 = knew<Process>();
++  p1->exec("schedAffinityTest");
++
++  //Process* p1 = knew<Process>();
++  //p1->exec("Programs");
++/*#if !TESTING_KEYCODE_LOOP
+   Process* p1 = knew<Process>();
+   p1->exec("kbloop");
+ #endif
+   Process* p2 = knew<Process>();
+   p2->exec("threadtest");
+   Process* p3 = knew<Process>();
+-  p3->exec("manythread");
++  p3->exec("manythread");*/
+   return 0;
+ }
+diff --git a/src/runtime/Scheduler.cc b/src/runtime/Scheduler.cc
+index 56ee767..27c1ec8 100644
+--- a/src/runtime/Scheduler.cc
++++ b/src/runtime/Scheduler.cc
+@@ -1,5 +1,5 @@
+ /******************************************************************************
+-    Copyright © 2012-2015 Martin Karsten
++    Copyright ï¿½ 2012-2015 Martin Karsten
+ 
+     This program is free software: you can redistribute it and/or modify
+     it under the terms of the GNU General Public License as published by
+@@ -19,6 +19,9 @@
+ #include "runtime/Stack.h"
+ #include "runtime/Thread.h"
+ #include "kernel/Output.h"
++#include "syscalls.h"
++
++
+ 
+ Scheduler::Scheduler() : readyCount(0), preemption(0), resumption(0), partner(this) {
+   Thread* idleThread = Thread::create((vaddr)idleStack, minimumStack);
+@@ -44,7 +47,7 @@ inline void Scheduler::switchThread(Scheduler* target, Args&... a) {
+   CHECK_LOCK_MIN(sizeof...(Args));
+   Thread* nextThread;
+   readyLock.acquire();
+-//  for (mword i = 0; i < (target ? idlePriority : maxPriority); i += 1) {
++  //  for (mword i = 0; i < (target ? idlePriority : maxPriority); i += 1) {
+   for (mword i = 0; i < ((target == this) ? idlePriority : maxPriority);
+ i += 1) {
+     if (!readyQueue[i].empty()) {
+@@ -127,22 +130,50 @@ void Scheduler::preempt() {               // IRQs disabled, lock count inflated
+ 	  /* use Martin's code when no affinity is set via bit mask */
+ 	  target =  Runtime::getCurrThread()->getAffinity();
+    }  else {
+-	  /* CPSC457l: Add code here to scan the affinity mask
+-      * and select the processor with the smallest ready count.
+-      * Set the scheduler of the selected processor as target
+-      * switchThread(target) migrates the current thread to
+-      * specified target's ready queue
+-      */
+-
++  /* CPSC457l: Add code here to scan the affinity mask
++   * and select the processor with the smallest ready count.
++   * Set the scheduler of the selected processor as target
++   * switchThread(target) migrates the current thread to
++   * specified target's ready queue
++   */
++    //Initializing
++     int lowestQueueCount = -1;
++     int coreToUse = -1;
++     int i = 1;
++     int temp = 0;
++     int flag = 0;
++
++     //goes through every core
++     for (int counter = 0; counter < get_core_count(); counter++){
++       //temp = 1 followed by counter amount of zeros.
++       //(Ex. if counter = 3, temp = 1000)
++        temp = i << counter;
++        //Check if core & temp are not zero (meaning it is a value)
++        if ((affinityMask & temp) != 0){
++          //First time we get a core that matches run with it as lowest
++          if (flag == 0){
++            flag = 1;
++            lowestQueueCount = Machine::getScheduler(counter)->readyCount;
++            coreToUse = counter;
++          }else{ //Else compare and see if it lower than curr lowest.
++            int queueCount = Machine::getScheduler(counter)->readyCount;
++            if (queueCount < lowestQueueCount){
++              lowestQueueCount = queueCount;
++              coreToUse = counter;
++            }
++          }
++        }
++     }
++     //Update target
++     target = Machine::getScheduler(coreToUse);
+    }
+-
+-#if TESTING_ALWAYS_MIGRATE
+-  if (!target) target = partner;
+-#else /* simple load balancing */
+-  if (!target) target = (partner->readyCount + 2 < readyCount) ? partner : this;
+-#endif
+-  switchThread(target);
+-#endif
++    #if TESTING_ALWAYS_MIGRATE
++      if (!target) target = partner;
++    #else /* simple load balancing */
++      if (!target) target = (partner->readyCount + 2 < readyCount) ? partner : this;
++    #endif
++      switchThread(target);
++    #endif
+ }
+ 
+ void Scheduler::suspend(BasicLock& lk) {
+diff --git a/src/ulib/libKOS.cc b/src/ulib/libKOS.cc
+index df25685..341662e 100644
+--- a/src/ulib/libKOS.cc
++++ b/src/ulib/libKOS.cc
+@@ -1,5 +1,5 @@
+ /******************************************************************************
+-    Copyright © 2012-2015 Martin Karsten
++    Copyright ï¿½ 2012-2015 Martin Karsten
+ 
+     This program is free software: you can redistribute it and/or modify
+     it under the terms of the GNU General Public License as published by
+@@ -43,6 +43,16 @@ extern "C" void _exit(int) {
+   for (;;); // never reached...
+ }
+ 
++extern "C" int sched_getaffinity(pid_t pid, size_t cpusetsize, cpu_set_t * mask){
++  ssize_t ret = syscallStub(SyscallNum::sched_getaffinity, pid, cpusetsize, mword(mask));
++  if (ret < 0){ *__errno() = -ret; return -1; } else return ret;
++}
++//Set and Get affinity stubs, does error checking.
++extern "C" int sched_setaffinity(pid_t pid, size_t cpusetsize, cpu_set_t * mask){
++  ssize_t ret = syscallStub(SyscallNum::sched_setaffinity, pid, cpusetsize, mword(mask));
++  if (ret < 0){ *__errno() = -ret; return -1; } else return ret;
++}
++
+ extern "C" int open(const char *path, int oflag, ...) {
+   ssize_t ret = syscallStub(SyscallNum::open, mword(path), oflag);
+   if (ret < 0) { *__errno() = -ret; return -1; } else return ret;
+diff --git a/src/user/Programs.cc b/src/user/Programs.cc
+new file mode 100644
+index 0000000..8ac9d95
+--- /dev/null
++++ b/src/user/Programs.cc
+@@ -0,0 +1,12 @@
++#include <iostream>
++#include "syscalls.h"
++#include "pthread.h"
++
++using namespace std;
++
++
++
++int main() {
++  for(;;){
++  }
++}
+diff --git a/src/user/progA.cc b/src/user/progA.cc
+new file mode 100644
+index 0000000..b64aa86
+--- /dev/null
++++ b/src/user/progA.cc
+@@ -0,0 +1,14 @@
++#include <iostream>
++#include "syscalls.h"
++#include "pthread.h"
++
++using namespace std;
++
++
++
++int main() {
++  cpu_set_t mask = 0x2;
++  sched_setaffinity(0, sizeof(cpu_set_t), &mask);
++  for(;;){
++  }
++}
+diff --git a/src/user/progB.cc b/src/user/progB.cc
+new file mode 100644
+index 0000000..331475b
+--- /dev/null
++++ b/src/user/progB.cc
+@@ -0,0 +1,14 @@
++#include <iostream>
++#include "syscalls.h"
++#include "pthread.h"
++
++using namespace std;
++
++
++
++int main() {
++  cpu_set_t mask = 0x4;
++  sched_setaffinity(0, sizeof(cpu_set_t), &mask);
++  for(;;){
++  }
++}
+diff --git a/src/user/progC.cc b/src/user/progC.cc
+new file mode 100644
+index 0000000..0d0444c
+--- /dev/null
++++ b/src/user/progC.cc
+@@ -0,0 +1,14 @@
++#include <iostream>
++#include "syscalls.h"
++#include "pthread.h"
++
++using namespace std;
++
++
++
++int main() {
++  cpu_set_t mask = 0x8;
++  sched_setaffinity(0, sizeof(cpu_set_t), &mask);
++  for(;;){
++  }
++}
+diff --git a/src/user/schedAffinityTest.cc b/src/user/schedAffinityTest.cc
+new file mode 100644
+index 0000000..ce2c9a9
+--- /dev/null
++++ b/src/user/schedAffinityTest.cc
+@@ -0,0 +1,126 @@
++#include <iostream>
++#include "syscalls.h"
++#include "pthread.h"
++
++using namespace std;
++
++#define MASK1 0x1  // 00001
++#define MASK2 0x3  // 00011
++#define MASK3 0x4  // 00100
++#define MASK4 0x8  // 01000
++#define MASK5 0x6  // 00110
++#define MASK6 0x10 // 10000
++
++#define REPETITION 5
++
++
++void* dummy (void *args) {
++   //pinning thread to core 1
++   cpu_set_t mask = MASK2;
++   sched_setaffinity( 0, sizeof(cpu_set_t), &mask );
++   int count = REPETITION;
++   while (count--){
++		for( int i=0; i<1000000000; i++) asm("");
++	}
++}
++
++void whereAmI(){
++   /* test on which core the process is running */
++   int count = REPETITION;
++   while (count--){
++	   for( int i=0; i<100000000; i++) asm("");
++         cout << "I am running on core "<< getcid() << endl;
++   }
++}
++
++void printAffinity( cpu_set_t affinityMask ){
++   mword cpuCount = get_core_count();
++	mword bitmask  = 0x1;
++   for( mword i=0; i<cpuCount; i++ ){
++		if( (affinityMask & (bitmask << i)) != 0 ){
++			cout << "Current process has affinity to core "<<i << endl;
++		}
++	}
++}
++
++int main() {
++
++   int err=5;
++   cout << "Test process is running on core "<< getcid() << endl;
++
++   /* sched_setaffinity */
++   cout << endl << "SCHED_SETAFFINITY TEST 1" << endl;
++   cpu_set_t affinityMask = MASK6;
++   //cout << "Setting Mask to "<< affinityMask << " for pid 0 "<< endl;
++   err = sched_setaffinity( 0, sizeof(cpu_set_t), &affinityMask );
++   if( err == -1 ){
++      cout << "sched_setaffinity unsuccessful" << endl;
++   } else {
++      //cout << "sched_setaffinity successful" << endl;
++	   whereAmI();
++   }
++
++   cout << endl << "SCHED_SETAFFINITY TEST 2" << endl;
++   err = 5;
++   affinityMask = MASK1;
++   //cout << "Setting Mask to "<< affinityMask << " for pid 2" << endl;
++   err = sched_setaffinity( 2, sizeof(cpu_set_t), &affinityMask );
++   if( err == -1 ){
++      cout << "sched_setaffinity unsuccessful"<< endl;
++   }else {
++      //cout << "sched_setaffinity successful" << endl;
++   	whereAmI();
++   }
++
++   cout << endl << "SCHED_SETAFFINITY TEST 3" << endl;
++   err = 5;
++   affinityMask = MASK1;
++   //cout << "Setting Mask to "<< affinityMask << " for pid 0 " << endl;
++   err = sched_setaffinity( 0, sizeof(cpu_set_t), &affinityMask );
++   if( err == -1 ){
++      cout << "sched_setaffinity unsuccessful" << endl;
++   }else{
++      //cout << "sched_setaffinity successful " << endl;
++   	whereAmI();
++	}
++
++
++   cout << endl << "SCHED_SETAFFINITY TEST 4" << endl;
++   err = 5;
++   affinityMask = MASK5;
++   //cout << "Setting Mask to "<< affinityMask << " for pid 0 " << endl;
++   err = sched_setaffinity( 0, sizeof(cpu_set_t), &affinityMask );
++   if( err == -1 ){
++      cout << "sched_setaffinity unsuccessful" << endl;
++   }else{
++      //cout << "sched_setaffinity successful" << endl;
++   	whereAmI();
++	}
++   pthread_t t1;
++   pthread_create(&t1, nullptr, dummy, nullptr);
++   whereAmI();
++   whereAmI();
++   whereAmI();
++
++   /* sched_getaffinity */
++   cout << endl << "SCHED_GETAFFINITY TEST 1" << endl;
++   err = 5;
++   err = sched_getaffinity( 2, sizeof(cpu_set_t), &affinityMask );
++   if( err == -1 ){
++      cout << "sched_getaffinity unsuccessful" << endl;
++   }else{
++  		printAffinity(affinityMask);
++   }
++
++
++   cout << endl << "SCHED_GETAFFINITY TEST 2" << endl;
++   err = 5;
++   err = sched_getaffinity( 0, sizeof(cpu_set_t), &affinityMask );
++   if( err == -1 ){
++      cout << "sched_getaffinity unsuccessful" << endl;
++   }else{
++  		printAffinity(affinityMask);
++   }
++#if 0
++#endif
++}
+-- 
+2.7.4
+
